@@ -1,20 +1,33 @@
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
+import os
 
 
 class QdrantStorage:
-    def __init__(self, url="http://localhost:6333", collection="docs", dim=3072):
+    def __init__(self, url: str | None = None, collection="docs", dim=3072, path: str = "qdrant_storage"):
         """
         Initialize connection to Qdrant and ensure the collection exists.
 
         Args:
-            url: Address of the Qdrant server
+            url: Address of the Qdrant server (optional; defaults to QDRANT_URL env var)
             collection: Name of the collection (like a table in DB)
             dim: Dimension of embedding vectors (must match your embedding model)
+            path: Local embedded Qdrant storage path (used when no remote URL is configured)
         """
 
-        # Create a client to communicate with Qdrant server
-        self.client = QdrantClient(url=url, timeout=30)
+        remote_url = url or os.getenv("QDRANT_URL")
+        local_path = os.getenv("QDRANT_PATH", path)
+
+        # Prefer local embedded storage unless remote URL is explicitly provided.
+        if remote_url:
+            try:
+                self.client = QdrantClient(url=remote_url, timeout=30)
+                # Trigger a request to verify connectivity early.
+                self.client.get_collections()
+            except Exception:
+                self.client = QdrantClient(path=local_path, timeout=30)
+        else:
+            self.client = QdrantClient(path=local_path, timeout=30)
 
         # Store collection name for reuse
         self.collection = collection
@@ -75,13 +88,23 @@ class QdrantStorage:
                 - sources: set of unique sources
         """
 
-        # Perform similarity search in Qdrant
-        results = self.client.search(
-            collection_name=self.collection,   # where to search
-            query_vector=query_vector,         # query embedding
-            with_payload=True,                 # include metadata in results
-            limit=top_k                        # number of results to return
-        )
+        # Perform similarity search in Qdrant.
+        # Newer qdrant-client versions expose `query_points` instead of `search`.
+        if hasattr(self.client, "query_points"):
+            query_response = self.client.query_points(
+                collection_name=self.collection,
+                query=query_vector,
+                with_payload=True,
+                limit=top_k,
+            )
+            results = getattr(query_response, "points", [])
+        else:
+            results = self.client.search(
+                collection_name=self.collection,
+                query_vector=query_vector,
+                with_payload=True,
+                limit=top_k,
+            )
 
         # Store extracted text and sources
         contexts = []   # relevant text chunks
