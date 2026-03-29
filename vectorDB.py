@@ -1,6 +1,12 @@
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 import os
+import threading
+
+# Thread-safe singleton for local Qdrant storage
+_local_client = None
+_client_lock = threading.Lock()
 
 
 class QdrantStorage:
@@ -16,18 +22,35 @@ class QdrantStorage:
         """
 
         remote_url = url or os.getenv("QDRANT_URL")
-        local_path = os.getenv("QDRANT_PATH", path)
 
-        # Prefer local embedded storage unless remote URL is explicitly provided.
         if remote_url:
-            try:
-                self.client = QdrantClient(url=remote_url, timeout=30)
-                # Trigger a request to verify connectivity early.
-                self.client.get_collections()
-            except Exception:
-                self.client = QdrantClient(path=local_path, timeout=30)
+            # Use remote Qdrant server (supports concurrent access)
+            self.client = QdrantClient(url=remote_url, timeout=30)
+            self.is_remote = True
         else:
-            self.client = QdrantClient(path=local_path, timeout=30)
+            # Use local embedded storage with singleton pattern (avoid concurrent access conflicts)
+            global _local_client
+            
+            with _client_lock:
+                if _local_client is None:
+                    local_path = os.getenv("QDRANT_PATH", path)
+                    try:
+                        # Try to connect to local embedded storage
+                        _local_client = QdrantClient(path=local_path, timeout=30)
+                    except RuntimeError as e:
+                        # If it fails due to concurrent access, suggest using remote server
+                        raise RuntimeError(
+                            f"Cannot access local Qdrant storage: {e}\n"
+                            "Solution: Use QDRANT_URL environment variable to connect to a remote Qdrant server.\n"
+                            "Option 1 (with Docker):\n"
+                            '  docker run -d --name qdrant -p 6333:6333 qdrant/qdrant:latest\n'
+                            '  $env:QDRANT_URL = "http://127.0.0.1:6333"\n'
+                            "Option 2 (use Qdrant Cloud free tier):\n"
+                            '  $env:QDRANT_URL = "https://your-cluster.qdrant.io"'
+                        ) from e
+                
+                self.client = _local_client
+                self.is_remote = False
 
         # Store collection name for reuse
         self.collection = collection
@@ -131,3 +154,59 @@ class QdrantStorage:
             "contexts": contexts,   # list of relevant text chunks
             "sources": sources      # unique sources (e.g., file names)
         }
+
+    def delete_by_source(self, source_id: str) -> None:
+        """
+        Delete all vectors whose payload source matches the provided source_id.
+
+        Args:
+            source_id: Source identifier used during ingestion (typically PDF filename)
+        """
+
+        self.client.delete(
+            collection_name=self.collection,
+            points_selector=Filter(
+                must=[
+                    FieldCondition(
+                        key="source",
+                        match=MatchValue(value=source_id)
+                    )
+                ]
+            ),
+            wait=True,
+        )
+
+    def get_all_sources(self) -> set[str]:
+        """
+        Get all unique source identifiers currently in the collection.
+
+        Returns:
+            Set of unique source IDs
+        """
+        try:
+            # Scroll through all points to collect sources
+            points, _ = self.client.scroll(
+                collection_name=self.collection,
+                limit=10000,
+                with_payload=True,
+            )
+            sources = set()
+            for point in points:
+                payload = getattr(point, "payload", None) or {}
+                source = payload.get("source", "")
+                if source:
+                    sources.add(source)
+            return sources
+        except Exception:
+            return set()
+
+    def clear_collection(self) -> None:
+        """
+        Delete all vectors from the collection.
+        WARNING: This is destructive and cannot be undone.
+        """
+        self.client.delete(
+            collection_name=self.collection,
+            points_selector=Filter(must=[]),  # Empty filter = match all
+            wait=True,
+        )
